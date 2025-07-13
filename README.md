@@ -1,28 +1,20 @@
 PDF-to-LLM
-=========
+===========
 
-A tool for extracting and converting academic PDFs into Markdown for LLM processing.
-
-Directory Structure
--------------------
-- code/: Python scripts
-- pdf/: Input PDFs
-- output/: All generated outputs (Markdown, figures)
+A tool for extracting text, tables, and figures from academic PDFs into Markdown for LLM processing.
 
 Requirements
 ------------
-See requirements.txt for dependencies. Install with:
-
-    pip install -r requirements.txt
+- Python 3.8+
+- pip install -r requirements.txt
+- Optional: Tesseract OCR for figure text extraction
 
 Usage
 -----
+Single PDF:
+    python code/pdf_to_llm.py pdf/yourfile.pdf -o output/yourfile.md --tables --figures --ocr
 
-    python code/pdf_to_llm_improved.py pdf/yourfile.pdf -o output/yourfile.md --tables --figures --ocr
+Batch all PDFs:
+    python code/batch_pdf_to_md.py
 
-Options:
-- --tables: Extract tables
-- --figures: Extract figures
-- --ocr: OCR on figures
-
-Outputs are written to the output/ directory. 
+All outputs are written to the output/ directory. Figures are saved in output/[pdfname]_figures/. 
