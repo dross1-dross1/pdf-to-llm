@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""
-pdf_to_llm_improved.py
 
-An improved CLI tool to extract and clean text, tables, and figures from PDFs into LLM-ready Markdown.
-
-Usage:
-    python pdf_to_llm_improved.py input.pdf [-o output.md] [--tables] [--figures] [--ocr] [--verbose]
-
-Dependencies:
-    pip install click PyMuPDF pillow pytesseract pandas tabula-py
-Please install the Tesseract OCR engine separately if you plan to use --ocr on Windows e.g. via Chocolatey: `choco install tesseract`.
-"""
 import os
 import re
 import sys
@@ -70,6 +59,10 @@ def extract_text(pdf_path: str) -> str:
 def clean_text_improved(text: str) -> str:
     """Overhauled text cleaning function focusing on robust heading detection and paragraph reconstruction."""
     
+    # De-hyphenate words broken across lines.
+    # This is a common artifact from PDF text extraction from two-column layouts.
+    text = re.sub(r'([a-zA-Z])-\n([a-zA-Z])', r'\1\2', text)
+
     # A regex to join lines that are likely part of the same sentence.
     text = re.sub(r'(?<![.!?:])\n(?=[a-z])', ' ', text)
     
@@ -100,6 +93,15 @@ def clean_text_improved(text: str) -> str:
         cleaned_lines.append(line)
     text = '\n'.join(cleaned_lines)
 
+    # Fix common equation and symbol character mapping issues
+    replacements = {
+        'ð': '(', 'Þ': ')', '1⁄4': '=', '': '-', '': ' * ',
+        'þ': '->', 'ﬁ': 'fi', 'ﬂ': 'fl', 'ﬃ': 'ffi', 'ﬄ': 'ffl',
+        '·': '*', '’': "'", '“': '"', '”': '"', 'Σ': 'sum'
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
     # Initial cleanup of common artifacts
     text = re.sub(r"\(cid:\d+\)", "", text)  # Remove font artifacts
     text = re.sub(r"Ç", "", text) # Remove strange artifacts
@@ -113,6 +115,10 @@ def clean_text_improved(text: str) -> str:
     for para in paragraphs:
         para = para.strip()
         if not para:
+            continue
+
+        # Remove recurring title header (more robustly)
+        if "learning without forgetting" in para.lower() and len(para.split()) < 10:
             continue
             
         # 3. Handle References section
@@ -223,16 +229,38 @@ def extract_tables_improved(pdf_path: str) -> List[str]:
     return tables
 
 
+def rect_distance(r1, r2):
+    """Calculate the distance between two rectangles."""
+    # Horizontal distance
+    if r1.x1 < r2.x0:
+        dx = r2.x0 - r1.x1
+    elif r2.x1 < r1.x0:
+        dx = r1.x0 - r2.x1
+    else:
+        dx = 0
+    # Vertical distance
+    if r1.y1 < r2.y0:
+        dy = r2.y0 - r1.y1
+    elif r2.y1 < r1.y0:
+        dy = r1.y0 - r2.y1
+    else:
+        dy = 0
+    return (dx**2 + dy**2)**0.5
+
+
 def extract_figures_improved(pdf_path: str, output_dir: str, ocr: bool = False) -> List[str]:
-    """Improved figure extraction by rendering figure areas instead of extracting raw images."""
-    logger.info(f"Extracting figures to {output_dir} by rendering page areas.")
-    
+    """
+    Extracts figures and diagrams from a PDF by identifying both image blocks and vector graphics.
+    It renders the areas containing these elements to capture them accurately.
+    """
+    logger.info(f"Extracting figures from {pdf_path} using a more comprehensive method.")
+
     try:
         from PIL import Image
     except ImportError:
         logger.warning("Pillow not found; skipping figures")
         return []
-    
+
     # Setup OCR if requested
     ocr_available = False
     if ocr:
@@ -240,93 +268,83 @@ def extract_figures_improved(pdf_path: str, output_dir: str, ocr: bool = False) 
             import pytesseract
             pytesseract.get_tesseract_version()
             ocr_available = True
-            logger.info("OCR enabled")
+            logger.info("OCR enabled for figure extraction")
         except (ImportError, pytesseract.pytesseract.TesseractNotFoundError):
-            logger.warning("OCR requested but Tesseract not available")
-    
-    # Create output directory
+            logger.warning("OCR requested but Tesseract not available.")
+
     os.makedirs(output_dir, exist_ok=True)
-    
     figs_md = []
     doc = fitz.open(pdf_path)
-    
     fig_count = 0
-    for page_num in range(len(doc)):
-        page = doc[page_num]
+
+    for page_num, page in enumerate(doc):
+        # 1. Get bboxes for both raster images and vector graphics (drawings)
+        image_info = page.get_image_info(xrefs=True)
+        image_bboxes = [fitz.Rect(info['bbox']) for info in image_info]
+        drawing_bboxes = [path["rect"] for path in page.get_drawings()]
         
-        # Use get_text("dict") to find image blocks and their bounding boxes
-        page_dict = page.get_text("dict")
-        for block in page_dict.get("blocks", []):
-            if block.get("type") == 1:  # This is an image block
+        all_bboxes = image_bboxes + drawing_bboxes
+
+        # 2. Merge overlapping or nearby bounding boxes to group elements
+        if not all_bboxes:
+            continue
+        
+        merged_bboxes = []
+        all_bboxes.sort(key=lambda r: (r.y0, r.x0)) # Sort top-to-bottom, left-to-right
+
+        if all_bboxes:
+            current_bbox = all_bboxes[0]
+            for bbox in all_bboxes[1:]:
+                # Merge if boxes intersect or are close and overlap on one axis
+                if current_bbox.intersects(bbox) or rect_distance(current_bbox, bbox) < 20:
+                    current_bbox |= bbox  # Union of the two rectangles
+                else:
+                    merged_bboxes.append(current_bbox)
+                    current_bbox = bbox
+            merged_bboxes.append(current_bbox)
+        
+        # 3. Filter out small artifacts that are unlikely to be figures
+        final_bboxes = [r for r in merged_bboxes if r.width > 50 and r.height > 50]
+
+        for bbox in final_bboxes:
+            fig_count += 1
+            
+            # Slightly enlarge the bbox to ensure the whole figure is captured
+            bbox.x0 -= 10
+            bbox.y0 -= 10
+            bbox.x1 += 10
+            bbox.y1 += 10
+
+            # Render the region at a high DPI for clarity
+            pix = page.get_pixmap(clip=bbox.irect, dpi=300)
+            
+            fname = f"figure_{page_num+1}_{fig_count}.png"
+            outpath = os.path.join(output_dir, fname)
+            pix.save(outpath)
+            
+            md_path = outpath.replace(os.sep, '/')
+            md_line = f"![Figure {page_num+1}.{fig_count}]({md_path})"
+
+            # 4. Extract nearby text as a potential caption
+            caption_bbox = fitz.Rect(bbox.x0, bbox.y1, bbox.x1, bbox.y1 + 50)
+            caption_text = page.get_text(clip=caption_bbox, sort=True).strip()
+            if caption_text and len(caption_text.split()) > 3: # Basic check for a valid caption
+                 md_line += f"\n\n*Potential caption:* {caption_text}"
+
+            if ocr_available:
                 try:
-                    fig_count += 1
-                    bbox = fitz.Rect(block["bbox"])
-                    
-                    # Slightly enlarge the bbox to ensure the whole figure is captured
-                    bbox.x0 -= 10
-                    bbox.y0 -= 10
-                    bbox.x1 += 10
-                    bbox.y1 += 10
-
-                    # Render the region at a high DPI for clarity
-                    pix = page.get_pixmap(clip=bbox, dpi=300)
-                    
-                    # Create descriptive filename
-                    fname = f"figure_{page_num+1}_{fig_count}.png"
-                    outpath = os.path.join(output_dir, fname)
-                    
-                    # Save image
-                    pix.save(outpath)
-                    
-                    # Create markdown reference
-                    md_path = outpath.replace(os.sep, '/')
-                    md_line = f"![Figure {page_num+1}.{fig_count}]({md_path})"
-                    
-                    # Add OCR text if requested and available
-                    if ocr_available:
-                        try:
-                            pil_img = Image.open(outpath)
-                            text = pytesseract.image_to_string(pil_img)
-                            text = unicodedata.normalize("NFKC", text).strip()
-                            if text:
-                                md_line += f"\n\n*OCR text for Figure {page_num+1}.{fig_count}:*\n```\n{text}\n```"
-                        except Exception as e:
-                            logger.warning(f"OCR failed for {fname}: {e}")
-                    
-                    figs_md.append(md_line)
-                    
+                    text = pytesseract.image_to_string(Image.open(outpath))
+                    text = unicodedata.normalize("NFKC", text).strip()
+                    if text:
+                        md_line += f"\n\n*OCR text:*\n```\n{text}\n```"
                 except Exception as e:
-                    logger.warning(f"Failed to extract figure {fig_count} from page {page_num+1}: {e}")
-    
+                    logger.warning(f"OCR failed for {fname}: {e}")
+            
+            figs_md.append(md_line)
+
     doc.close()
-    logger.info(f"Extracted {len(figs_md)} figures")
+    logger.info(f"Extracted {len(figs_md)} figures using comprehensive method.")
     return figs_md
-
-
-def extract_figure_captions(doc) -> Dict[str, str]:
-    """Extract figure captions from the PDF text."""
-    captions = {}
-    
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        text = page.get_text("text")
-        
-        # Look for figure caption patterns
-        patterns = [
-            r"Fig\.\s*(\d+\.\d+)[:\s]+(.*?)(?=\n|$)",
-            r"Figure\s*(\d+\.\d+)[:\s]+(.*?)(?=\n|$)",
-            r"FIG\.\s*(\d+\.\d+)[:\s]+(.*?)(?=\n|$)",
-        ]
-        
-        for pattern in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-            for match in matches:
-                fig_num = match.group(1)
-                caption = match.group(2).strip()
-                if caption:
-                    captions[fig_num] = caption
-    
-    return captions
 
 
 def validate_extraction(pdf_path: str, output_md: str) -> Dict[str, any]:
